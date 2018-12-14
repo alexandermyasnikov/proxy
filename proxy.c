@@ -68,6 +68,12 @@ struct proxy_fd_key_t {
   int   fd_inv;
 };
 
+int proxy_fd_key_cmp(const void* p1, const void* p2) {
+  struct proxy_fd_key_t* r1 = (struct proxy_fd_key_t*) p1;
+  struct proxy_fd_key_t* r2 = (struct proxy_fd_key_t*) p2;
+  return r1->fd - r2->fd;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 #define RULES_MAX_COUNT    100
@@ -86,12 +92,13 @@ struct proxy_t {
 };
 
 int proxy_init(struct proxy_t* proxy);
-int proxy_create_server_socket(struct proxy_t* proxy, struct proxy_rule_ext_t* rule_ext);
 int proxy_start(struct proxy_t* proxy);
-int proxy_process(struct proxy_t* proxy);
 int proxy_stop(struct proxy_t* proxy);
+int proxy_process(struct proxy_t* proxy);
 int proxy_add_rule(struct proxy_t* proxy, struct proxy_rule_t* rule);
+int proxy_create_server_socket(struct proxy_t* proxy, struct proxy_rule_ext_t* rule_ext);
 int proxy_set_nonblock(int fd);
+int proxy_accept(struct proxy_t* proxy, struct proxy_rule_ext_t* rule_ext, int fd);
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -131,7 +138,7 @@ int proxy_create_server_socket(struct proxy_t* proxy, struct proxy_rule_ext_t* r
 
   struct sockaddr_in addr;
   memset((char *) &addr, 0, sizeof(addr));
-  addr.sin_family      = PF_INET;
+  addr.sin_family      = AF_INET;
   addr.sin_addr.s_addr = ip_src.s_addr;
   addr.sin_port        = htons(rule->port_src);
 
@@ -179,79 +186,63 @@ int proxy_start(struct proxy_t* proxy) {
 }
 
 int proxy_process(struct proxy_t* proxy) {
-  int ret; // XXX
-
-  int BUFFER_LEN = 1024; // XXX
-  uint8_t buffer[BUFFER_LEN]; // XXX
-
-  struct epoll_event* events = proxy->_events;
-
   int event_count = epoll_wait(proxy->_epfd, proxy->_events, EVENTS_MAX_COUNT, -1);
   printf("event_count: %d \n", event_count);
 
   for (int i = 0; i < event_count; i++) {
-    printf("events 0x%x \n", events[i].events);
-    printf("fd %d \n", events[i].data.fd);
+    struct epoll_event* event = &proxy->_events[i];
+    printf("events 0x%x \n", event->events);
+    printf("fd %d \n", event->data.fd);
 
-    if ((events[i].events & EPOLLERR) ||
-        (events[i].events & EPOLLHUP) ||
-        (!(events[i].events & EPOLLIN)))
+    struct proxy_fd_key_t fd_key;
+    fd_key.fd = event->data.fd;
+    struct proxy_fd_key_t * fd_key_copy = bsearch(&fd_key, proxy->_fds, proxy->_fds_count,
+        sizeof(proxy->_fds[0]), proxy_fd_key_cmp);
+
+    if ((event->events & EPOLLERR) ||
+        (event->events & EPOLLHUP) ||
+        (!(event->events & EPOLLIN)))
     {
       printf("epoll error \n");
-      close(events[i].data.fd);
+      close(event->data.fd);
+      close(fd_key_copy->fd_inv);
       continue;
     }
 
     struct proxy_rule_ext_t rule_ext;
-    rule_ext.fd = events[i].data.fd;
+    rule_ext.fd = event->data.fd;
     size_t rules_count = proxy->_rules_count;
-    void* rule_fd = lfind(&rule_ext, proxy->_rules, &rules_count,
+    void* rule = lfind(&rule_ext, proxy->_rules, &rules_count,
         sizeof(proxy->_rules[0]), proxy_rule_ext_cmp_fd);
 
-    if (rule_fd) {
-      int infd;
-      infd = accept(events[i].data.fd , 0, 0);
-      printf("infd: %d \n", infd);
-      if (infd == -1) {
-        break;
-      }
-
-      ret = proxy_set_nonblock(infd);
-      printf("proxy_set_nonblock(...): %d \n", ret);
-      if (ret == -1) {
-        return -1;
-      }
-
-      struct epoll_event event;
-      event.data.fd = infd;
-      event.events = EPOLLIN;
-      ret = epoll_ctl(proxy->_epfd, EPOLL_CTL_ADD, infd, &event);
-      printf("epoll_ctl(...): %d \n", ret);
-      if (ret == -1) {
-        return -1;
-      }
-
-      // open dst socket // TODO
-      // struct proxy_fd_key_t     _fds[FDS_MAX_COUNT];
-      // int                       _fds_count;
+    if (rule) {
+      proxy_accept(proxy, rule, event->data.fd);
       continue;
     }
 
     {
-      int bytes_read = read(events[i].data.fd, buffer, BUFFER_LEN);
-      printf("read: fd: %d, bytes_read: %d \n", events[i].data.fd, bytes_read);
+      uint8_t buffer[1024];
+
+      if (!fd_key_copy) {
+        return -1;
+      }
+
+      int bytes_read = read(event->data.fd, buffer, sizeof(buffer));
+      printf("read: fd: %d, bytes_read: %d \n", event->data.fd, bytes_read);
       if (bytes_read == -1) {
         if (errno != EAGAIN) {
           printf("errno: !EAGAIN \n");
-          close(events[i].data.fd);
+          close(event->data.fd);
+          close(fd_key_copy->fd_inv);
         }
       } else if (bytes_read == 0) {
         printf("bytes_read == 0 \n");
-        shutdown(events[i].data.fd, SHUT_RDWR);
-        close(events[i].data.fd);
+        shutdown(event->data.fd, SHUT_RDWR);
+        close(event->data.fd);
+        close(fd_key_copy->fd_inv);
       } else {
         print_hex(buffer, bytes_read);
-        write(events[i].data.fd, "ok\n", 4);
+        write(fd_key_copy->fd_inv, buffer, bytes_read);
       }
     }
   }
@@ -295,6 +286,89 @@ int proxy_set_nonblock(int fd) {
   }
 
   return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+int proxy_accept(struct proxy_t* proxy, struct proxy_rule_ext_t* rule_ext, int fd) {
+  struct epoll_event event;
+  int fd_src;
+  int fd_dst;
+  int ret;
+
+  {
+    fd_src = accept(fd , 0, 0);
+    printf("fd_src: %d \n", fd_src);
+    if (fd_src == -1) {
+      return -1;
+    }
+
+    ret = proxy_set_nonblock(fd_src);
+    printf("proxy_set_nonblock(...): %d \n", ret);
+    if (ret == -1) {
+      return -1;
+    }
+
+    event.data.fd = fd_src;
+    event.events = EPOLLIN;
+    ret = epoll_ctl(proxy->_epfd, EPOLL_CTL_ADD, fd_src, &event);
+    printf("epoll_ctl(...): %d \n", ret);
+    if (ret == -1) {
+      return -1;
+    }
+  }
+
+  {
+    fd_dst = socket(AF_INET, SOCK_STREAM, 0);
+    printf("fd_dst: %d \n", fd_dst);
+    if (fd_dst == -1) {
+      return -1;
+    }
+
+    int on = 1;
+    ret = setsockopt(fd_dst, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    printf("setsockopt(...): %d \n", ret);
+    if (ret == -1) {
+      return -1;
+    }
+
+    struct in_addr ip_dst = {0};
+    ret = inet_pton(AF_INET, rule_ext->rule.ip_dst, &ip_dst);
+    printf("inet_pton(...): %d \n", ret);
+    if (ret == -1) {
+      return -1;
+    }
+
+    struct sockaddr_in addr;
+    memset((char *) &addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = ip_dst.s_addr;
+    addr.sin_port        = htons(rule_ext->rule.port_dst);
+
+    ret = connect(fd_dst, (struct sockaddr *) &addr, sizeof(addr));
+    printf("connect(...): %d \n", ret);
+    if (ret < 0) {
+      return -1;
+    }
+
+    event.data.fd = fd_dst;
+    event.events = EPOLLIN;
+    ret = epoll_ctl(proxy->_epfd, EPOLL_CTL_ADD, fd_dst, &event);
+    printf("epoll_ctl(...): %d \n", ret);
+    if (ret == -1) {
+      return -1;
+    }
+  }
+
+  if (proxy->_fds_count + 1 >= FDS_MAX_COUNT) { // _fds_count += 2
+    return -1;
+  }
+
+  proxy->_fds[proxy->_fds_count] = (struct proxy_fd_key_t) {fd_dst, fd_src};
+  proxy->_fds_count++;
+  proxy->_fds[proxy->_fds_count] = (struct proxy_fd_key_t) {fd_src, fd_dst};
+  proxy->_fds_count++;
+  qsort(proxy->_fds, proxy->_fds_count, sizeof(proxy->_fds[0]), proxy_fd_key_cmp);
+
+  return 0;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
