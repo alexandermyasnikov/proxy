@@ -14,7 +14,7 @@
 void print_hex(void* buf, int len) {
   printf("hex: {");
   for (int i = 0; i < len; ++i) {
-    printf("%x ", *((uint8_t*) buf) + i);
+    printf("%x ", *(i + (uint8_t*) buf));
   }
   printf("} %d \n", len);
 }
@@ -37,6 +37,7 @@ struct proxy_t {
 int proxy_start(struct proxy_t* proxy);
 int proxy_stop(struct proxy_t* proxy);
 int proxy_add_rule(struct proxy_t* proxy, struct proxy_rule_t* rule);
+int proxy_set_nonblock(int fd);
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -44,7 +45,7 @@ int proxy_start(struct proxy_t* proxy) {
   int ret;
   int sockfd;
   {
-    sockfd = socket(PF_INET, SOCK_STREAM, 0);
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
     printf("sockfd: %d \n", sockfd);
     if (sockfd == -1) {
       return -1;
@@ -76,19 +77,9 @@ int proxy_start(struct proxy_t* proxy) {
       return -1;
     }
 
-    // XXX
-    int flags;
-    flags = fcntl(sockfd, F_GETFL, 0);
-    if (flags == -1) {
-      printf("flags: %d \n", flags);
-      return -1;
-    }
-
-    // XXX
-    flags |= O_NONBLOCK;
-    ret = fcntl(sockfd, F_SETFL, flags);
+    ret = proxy_set_nonblock(sockfd);
+    printf("proxy_set_nonblock(...): %d \n", ret);
     if (ret == -1) {
-      printf("fcntl(...): %d \n", ret);
       return -1;
     }
 
@@ -111,7 +102,7 @@ int proxy_start(struct proxy_t* proxy) {
 
   ret = epoll_ctl(epfd, EPOLL_CTL_ADD, sockfd, &event);
 
-  int BUFFER_LEN = 10;
+  int BUFFER_LEN = 1024;
   uint8_t buffer[BUFFER_LEN];
 
   while (1) {
@@ -128,45 +119,25 @@ int proxy_start(struct proxy_t* proxy) {
         close(events[i].data.fd);
 
       } else if (events[i].data.fd == sockfd) {
-        while (1) {
-          struct sockaddr in_addr;
-          socklen_t in_len;
-          int infd;
+        int infd;
+        infd = accept(sockfd, 0, 0);
+        printf("infd: %d \n", infd);
+        if (infd == -1) {
+          break;
+        }
 
-          in_len = sizeof(in_addr);
-          infd = accept(sockfd, &in_addr, &in_len);
-          printf("infd: %d \n", infd);
-          if (infd == -1) {
-            if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
-              break;
-            } else {
-              printf("accept(...): %d \n", infd);
-              break;
-            }
-          }
+        ret = proxy_set_nonblock(infd);
+        printf("proxy_set_nonblock(...): %d \n", ret);
+        if (ret == -1) {
+          return -1;
+        }
 
-          int flags;
-          flags = fcntl(infd, F_GETFL, 0);
-          if (flags == -1) {
-            printf("flags: %d \n", flags);
-            return -1;
-          }
-
-          flags |= O_NONBLOCK;
-          ret = fcntl(infd, F_SETFL, flags);
-          if (ret == -1) {
-            printf("fcntl(...): %d \n", ret);
-            return -1;
-          }
-
-          event.data.fd = infd;
-          event.events = EPOLLIN | EPOLLET;
-          ret = epoll_ctl(epfd, EPOLL_CTL_ADD, infd, &event);
-          if (ret == -1) {
-            printf("epoll_ctl(...): %d \n", ret);
-            return -1;
-          }
-          break; // XXX
+        event.data.fd = infd;
+        event.events = EPOLLIN;
+        ret = epoll_ctl(epfd, EPOLL_CTL_ADD, infd, &event);
+        printf("epoll_ctl(...): %d \n", ret);
+        if (ret == -1) {
+          return -1;
         }
       } else {
         int bytes_read = read(events[i].data.fd, buffer, BUFFER_LEN);
@@ -178,6 +149,7 @@ int proxy_start(struct proxy_t* proxy) {
           }
         } else if (bytes_read == 0) {
           printf("bytes_read == 0 \n");
+          shutdown(events[i].data.fd, SHUT_RDWR);
           close(events[i].data.fd);
         } else {
           print_hex(buffer, bytes_read);
@@ -201,6 +173,16 @@ int proxy_add_rule(struct proxy_t* proxy, struct proxy_rule_t* rule) {
   printf("add_rule port_src: %d, ip_src: '%s', port_dst: %d, ip_dst: '%s' \n",
       rule->port_src, rule->ip_src, rule->port_dst, rule->ip_dst);
   return 0;
+}
+
+int proxy_set_nonblock(int fd) {
+  int flags;
+  flags = fcntl(fd, F_GETFL, 0);
+  if (flags == -1) {
+    flags = 0;
+  }
+
+  return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
