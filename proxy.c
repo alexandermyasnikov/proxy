@@ -93,10 +93,10 @@ struct proxy_t {
 
 int proxy_init(struct proxy_t* proxy);
 int proxy_start(struct proxy_t* proxy);
-int proxy_stop(struct proxy_t* proxy);
 int proxy_process(struct proxy_t* proxy);
 int proxy_add_rule(struct proxy_t* proxy, struct proxy_rule_t* rule);
 int proxy_create_server_socket(struct proxy_t* proxy, struct proxy_rule_ext_t* rule_ext);
+int proxy_close_socket(struct proxy_t* proxy, int fd);
 int proxy_set_nonblock(int fd);
 int proxy_accept(struct proxy_t* proxy, struct proxy_rule_ext_t* rule_ext, int fd);
 
@@ -192,11 +192,12 @@ int proxy_process(struct proxy_t* proxy) {
   for (int i = 0; i < event_count; i++) {
     struct epoll_event* event = &proxy->_events[i];
     printf("events 0x%x \n", event->events);
-    printf("fd %d \n", event->data.fd);
+    printf("fd: %d \n", event->data.fd);
+    printf("_fds_count: %d \n", proxy->_fds_count);
 
     struct proxy_fd_key_t fd_key;
     fd_key.fd = event->data.fd;
-    struct proxy_fd_key_t * fd_key_copy = bsearch(&fd_key, proxy->_fds, proxy->_fds_count,
+    struct proxy_fd_key_t* fd_key_copy = bsearch(&fd_key, proxy->_fds, proxy->_fds_count,
         sizeof(proxy->_fds[0]), proxy_fd_key_cmp);
 
     if ((event->events & EPOLLERR) ||
@@ -204,8 +205,10 @@ int proxy_process(struct proxy_t* proxy) {
         (!(event->events & EPOLLIN)))
     {
       printf("epoll error \n");
-      close(event->data.fd);
-      close(fd_key_copy->fd_inv);
+      if (fd_key_copy) {
+        proxy_close_socket(proxy, fd_key_copy->fd_inv);
+      }
+      proxy_close_socket(proxy, event->data.fd);
       continue;
     }
 
@@ -224,7 +227,9 @@ int proxy_process(struct proxy_t* proxy) {
       uint8_t buffer[1024];
 
       if (!fd_key_copy) {
-        return -1;
+        printf("!fd_key_copy \n");
+        proxy_close_socket(proxy, event->data.fd);
+        continue;
       }
 
       int bytes_read = read(event->data.fd, buffer, sizeof(buffer));
@@ -232,14 +237,14 @@ int proxy_process(struct proxy_t* proxy) {
       if (bytes_read == -1) {
         if (errno != EAGAIN) {
           printf("errno: !EAGAIN \n");
-          close(event->data.fd);
-          close(fd_key_copy->fd_inv);
+          proxy_close_socket(proxy, fd_key_copy->fd_inv);
+          proxy_close_socket(proxy, event->data.fd);
         }
       } else if (bytes_read == 0) {
         printf("bytes_read == 0 \n");
         shutdown(event->data.fd, SHUT_RDWR);
-        close(event->data.fd);
-        close(fd_key_copy->fd_inv);
+        proxy_close_socket(proxy, fd_key_copy->fd_inv);
+        proxy_close_socket(proxy, event->data.fd);
       } else {
         print_hex(buffer, bytes_read);
         write(fd_key_copy->fd_inv, buffer, bytes_read);
@@ -252,17 +257,15 @@ int proxy_process(struct proxy_t* proxy) {
   return 0;
 }
 
-int proxy_stop(struct proxy_t* proxy) {
-  return 0;
-}
-
 int proxy_add_rule(struct proxy_t* proxy, struct proxy_rule_t* rule) {
   if (proxy->_rules_count >= RULES_MAX_COUNT) {
+    printf("!_rules_count >= RULES_MAX_COUNT \n");
     return -1;
   }
 
   void* rule_copy = bsearch(rule, proxy->_rules, proxy->_rules_count, sizeof(proxy->_rules[0]), proxy_rule_cmp);
   if (rule_copy) {
+    printf("!rule_copy \n");
     return -1;
   }
 
@@ -273,6 +276,27 @@ int proxy_add_rule(struct proxy_t* proxy, struct proxy_rule_t* rule) {
   printf("rules: \n");
   for (int i = 0; i < proxy->_rules_count; ++i) {
     proxy_rule_print(&proxy->_rules[i].rule);
+  }
+
+  return 0;
+}
+
+int proxy_close_socket(struct proxy_t* proxy, int fd) { // XXX меняет proxy->_fds
+  close(fd);
+
+  if (proxy->_fds_count < 1) {
+    printf("!_fds_count < 1 \n");
+    return -1;
+  }
+
+  struct proxy_fd_key_t fd_key = {fd, -1};
+  struct proxy_fd_key_t* fd_key_copy = bsearch(&fd_key, proxy->_fds, proxy->_fds_count,
+      sizeof(proxy->_fds[0]), proxy_fd_key_cmp);
+
+  if (fd_key_copy) {
+    proxy->_fds_count--;
+    *fd_key_copy = proxy->_fds[proxy->_fds_count];
+    qsort(proxy->_fds, proxy->_fds_count, sizeof(proxy->_fds[0]), proxy_fd_key_cmp);
   }
 
   return 0;
@@ -345,7 +369,7 @@ int proxy_accept(struct proxy_t* proxy, struct proxy_rule_ext_t* rule_ext, int f
 
     ret = connect(fd_dst, (struct sockaddr *) &addr, sizeof(addr));
     printf("connect(...): %d \n", ret);
-    if (ret < 0) {
+    if (ret == -1) {
       return -1;
     }
 
@@ -359,6 +383,7 @@ int proxy_accept(struct proxy_t* proxy, struct proxy_rule_ext_t* rule_ext, int f
   }
 
   if (proxy->_fds_count + 1 >= FDS_MAX_COUNT) { // _fds_count += 2
+    printf("_fds_count + 1 >= FDS_MAX_COUNT \n");
     return -1;
   }
 
@@ -387,7 +412,6 @@ int main() {
   proxy_add_rule(&proxy, &rule2);
   proxy_start(&proxy);
   while (!proxy_process(&proxy)) { }
-  proxy_stop(&proxy);
 
   printf("end... \n");
   return 0;
