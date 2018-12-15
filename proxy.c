@@ -179,7 +179,8 @@ int proxy_start(struct proxy_t* proxy) {
   printf("proxy->_epfd: %d \n", proxy->_epfd);
 
   for (int i = 0; i < proxy->_rules_count; ++i) {
-    proxy_create_server_socket(proxy, &proxy->_rules[i]);
+    int ret = proxy_create_server_socket(proxy, &proxy->_rules[i]);
+    printf("proxy_create_server_socket(...): %d \n", ret);
   }
 
   return 0;
@@ -251,8 +252,6 @@ int proxy_process(struct proxy_t* proxy) {
       }
     }
   }
-
-  sleep(1);
 
   return 0;
 }
